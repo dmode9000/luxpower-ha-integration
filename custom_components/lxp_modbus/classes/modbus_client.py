@@ -19,10 +19,13 @@ from ..const import (
     RESPONSE_OVERHEAD,
     RETRY_BACKOFF_MULTIPLIER,
     TOTAL_REGISTERS,
+    UNIMPLEMENTED_REGISTER_VALUE,
     WRITE_READ_TIMEOUT,
     WRITE_RETRY_DELAY,
 )
+from ..constants.hold_registers import H_FAN_CONTROL, H_FIRMWARE_CODE_0_1, H_SOFTWARE_VERSION_CNTL_FW
 from ..constants.input_registers import I_BAT_PARALLEL_NUM
+from ..utils import supports_fan_controls
 from .connection_manager import ModbusConnectionManager
 from .data_validator import is_data_sane
 from .lxp_batteries import LxpBatteries
@@ -96,9 +99,13 @@ class LxpModbusApiClient:
             reader, response_buf, expected_length, request_type, function_code
         )
 
-    async def async_request_registers(self, writer, reader, reg, request_type, function_code) -> dict:
-        """Request a block of registers and return parsed values."""
-        count = min(self._block_size, TOTAL_REGISTERS - reg) if (reg < BATTERY_INFO_START_REGISTER) else self._block_size
+    async def async_request_registers(
+        self, writer, reader, reg, request_type, function_code, *, count: int | None = None
+    ) -> dict:
+        """Request a polling block, or require an exact reply to an explicit count."""
+        exact = count is not None
+        if count is None:
+            count = min(self._block_size, TOTAL_REGISTERS - reg) if (reg < BATTERY_INFO_START_REGISTER) else self._block_size
         req = LxpRequestBuilder.prepare_packet_for_read(
             self._dongle_serial.encode(), self._inverter_serial.encode(),
             reg, count, function_code
@@ -148,14 +155,25 @@ class LxpModbusApiClient:
                           request_type, function_code, reg, reg + count - 1, response.info)
             return {}
 
-        if not is_data_sane(response.parsed_values_dictionary, request_type):
+        values = response.parsed_values_dictionary
+        if exact and (
+            response.register != reg
+            or len(values) != count
+            or response.value_length != count * 2
+            or len(response.data_frame) != 14 + response.value_length_byte_present + count * 2
+            or response.data_length != len(response.data_frame) + 2  # includes CRC
+        ):
+            _LOGGER.warning("Ignoring inexact %s(%s) response for register %s", request_type, function_code, reg)
+            return {}
+
+        if not is_data_sane(values, request_type):
             _LOGGER.debug("ignoring %s(%s) packet for regs %s-%s : data failed sanity checks",
                           request_type, function_code, reg, reg + count - 1)
             return {}
 
-        if len(response.parsed_values_dictionary) != count:
+        if len(values) != count:
             _LOGGER.debug("%s(%s) response has different register count (%s) than requested (%s)",
-                          request_type, function_code, len(response.parsed_values_dictionary), count)
+                          request_type, function_code, len(values), count)
 
         # Battery data needs special decoding — returns dict keyed by serial
         # This will not work correctly with small blocks if they are not aligned
@@ -164,7 +182,7 @@ class LxpModbusApiClient:
             _LOGGER.debug("Battery data decoded: %s", list(bat_dict.keys()))
             return bat_dict
 
-        return response.parsed_values_dictionary
+        return values
 
     def _warn_serial_mismatch(self, received: bytes | None) -> None:
         """Point at a mistyped inverter serial, the usual cause of "no data" (#110).
@@ -478,8 +496,18 @@ class LxpModbusApiClient:
 
         raise UpdateFailed(f"Error communicating with inverter: {error}")
 
-    async def async_write_register(self, register: int, value: int) -> bool:
-        """Write a single register value to the inverter with validation and retries."""
+    async def async_write_register(self, register: int, value: int, *, mask: int | None = None) -> bool:
+        """Write a word, or update and verify only the specified bits."""
+        if mask is not None:
+            # An unconfirmed write might already have taken effect; never send it again.
+            try:
+                if await self._async_write_once(register, value, 0, mask=mask):
+                    return True
+            except Exception as ex:
+                _LOGGER.error("Exception during masked write for register %s: %s", register, ex)
+            self.request_hold_refresh()
+            return False
+
         for attempt in range(self._connection_retries):
             if attempt > 0:
                 # Retry delay is taken outside the lock so a stalled write does not
@@ -496,19 +524,19 @@ class LxpModbusApiClient:
             if result is True:
                 return True
             if result is None:
-                # The inverter understood the request and refused it. Repeating it
-                # will produce the same refusal, so stop instead of hammering the
-                # dongle two more times.
+                # Stop on explicit rejection.
                 return False
 
         _LOGGER.error("Failed to write register %s after %d attempts.", register, self._connection_retries)
         return False
 
-    async def _async_write_once(self, register: int, value: int, attempt: int) -> bool | None:
+    async def _async_write_once(
+        self, register: int, value: int, attempt: int, *, mask: int | None = None
+    ) -> bool | None:
         """Perform a single write attempt and confirm it was applied.
 
-        Returns True on a confirmed write, False when the attempt failed in a way
-        worth retrying, and None when the inverter explicitly rejected the write.
+        Returns True on a confirmed write, False for a retryable failure, and None
+        if the inverter rejects the write. Masked writes are never retried.
         """
         async with self._lock:
             _LOGGER.debug("Write attempt %s/%s for register %s with value %s",
@@ -522,6 +550,26 @@ class LxpModbusApiClient:
 
             try:
                 await self._connection_manager.async_discard_initial_data(reader)
+
+                if mask is not None:
+                    # The entity checked availability before waiting for this lock.
+                    # A poll may have changed the firmware since then, and even the
+                    # client's last-good cache can survive an unreadable poll. Use
+                    # the same connection and lock as the read-modify-write.
+                    if register == H_FAN_CONTROL and not await self._async_check_fan_firmware(writer, reader):
+                        _LOGGER.warning("Cannot modify hold register %s without confirming supported firmware", register)
+                        return False
+                    try:
+                        current = (await self.async_request_registers(
+                            writer, reader, register, "hold", 3, count=1
+                        )).get(register)
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("Timed out reading hold register %s before write", register)
+                        return False
+                    if current is None or current == UNIMPLEMENTED_REGISTER_VALUE:
+                        _LOGGER.warning("Cannot modify unreadable hold register %s", register)
+                        return False
+                    value = (current & ~mask) | (value & mask)
 
                 req = LxpRequestBuilder.prepare_packet_for_write(
                     self._dongle_serial.encode(), self._inverter_serial.encode(), register, value
@@ -538,6 +586,11 @@ class LxpModbusApiClient:
                                 attempt + 1, register)
                 return False
             else:
+                if mask is not None:
+                    if not self._evaluate_write_response(response_buf, register, value, attempt, cache_echo=False):
+                        return False
+                    return await self._async_verify_masked_write(writer, reader, register, value, mask)
+
                 result = self._evaluate_write_response(response_buf, register, value, attempt)
                 if result is True:
                     # Reuse the open connection: confirming here costs one request,
@@ -546,6 +599,20 @@ class LxpModbusApiClient:
                 return result
             finally:
                 await self._connection_manager.async_close(writer)
+
+    async def _async_check_fan_firmware(self, writer, reader) -> bool:
+        """Require an exact, live firmware reply on the locked fan-write connection."""
+        try:
+            firmware = await self.async_request_registers(
+                writer, reader, H_FIRMWARE_CODE_0_1, "hold", 3,
+                count=H_SOFTWARE_VERSION_CNTL_FW - H_FIRMWARE_CODE_0_1 + 1,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return (
+            UNIMPLEMENTED_REGISTER_VALUE not in firmware.values()
+            and supports_fan_controls({"hold": firmware})
+        )
 
     async def _async_read_write_ack(self, frames: LxpFrameReader, register: int) -> bytes | None:
         """Read frames until the acknowledgement for ``register`` arrives.
@@ -570,8 +637,8 @@ class LxpModbusApiClient:
             _LOGGER.debug("discarding frame while waiting for write ack of register %s (%s): %s",
                           register, mismatch, response_buf.hex())
 
-    def _evaluate_write_response(self, response_buf: bytes, register: int, value: int,
-                                 attempt: int) -> bool | None:
+    def _evaluate_write_response(self, response_buf: bytes | None, register: int, value: int,
+                                 attempt: int, *, cache_echo: bool = True) -> bool | None:
         """Judge a write acknowledgement packet."""
         _LOGGER.debug(
             "Modbus WRITE: Sent to reg %s, value %s, resp: %s",
@@ -606,10 +673,9 @@ class LxpModbusApiClient:
         if register in response_dict:
             received_value = response_dict.get(register)
             if received_value == value:
-                _LOGGER.info("Successfully wrote register %s with value %s.", register, value)
-                # The acknowledgement echoes what the inverter stored, so the cache
-                # can hold a confirmed value without waiting for any read.
-                self._record_hold_read({register: received_value})
+                if cache_echo:
+                    _LOGGER.info("Successfully wrote register %s with value %s.", register, value)
+                    self._record_hold_read({register: received_value})
                 return True
 
             _LOGGER.warning("Write attempt %s failed: Confirmation mismatch, sent=%s received=%s",
@@ -619,6 +685,21 @@ class LxpModbusApiClient:
                             attempt + 1, register, response.info)
 
         return False
+
+    async def _async_verify_masked_write(self, writer, reader, register: int, value: int, mask: int) -> bool:
+        """Cache only a fresh word that confirms the requested field."""
+        try:
+            actual = (await self.async_request_registers(writer, reader, register, "hold", 3, count=1)).get(register)
+        except (asyncio.TimeoutError, OSError) as err:
+            _LOGGER.warning("Masked write readback failed for register %s: %s", register, err)
+            return False
+        if actual is None or actual == UNIMPLEMENTED_REGISTER_VALUE or (actual & mask) != (value & mask):
+            _LOGGER.warning("Masked write not confirmed for register %s (mask %04x, sent %04x, read %s)",
+                            register, mask, value, actual)
+            return False
+        self._record_hold_read({register: actual})
+        _LOGGER.info("Confirmed masked write to register %s (mask %04x, read %04x).", register, mask, actual)
+        return True
 
     async def _async_reread_hold_block(self, writer, reader, register: int) -> None:
         """Re-read the settings block holding ``register`` on the write connection.

@@ -5,8 +5,9 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import generate_entity_id
-from .utils import format_firmware_version
+from .utils import format_firmware_version, supports_fan_controls
 from .const import DOMAIN, INTEGRATION_TITLE, CONF_INVERTER_SERIAL, CONF_ENABLE_DEVICE_GROUPING, DEFAULT_ENABLE_DEVICE_GROUPING
+from .const import UNIMPLEMENTED_REGISTER_VALUE
 from .constants.input_registers import I_MASTER_SLAVE_PARALLEL_STATUS
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,6 +16,33 @@ _LOGGER = logging.getLogger(__name__)
 # "via_device_id" and will drop the old key in 2027.8. Both spellings have to work
 # while the minimum supported core is older than that.
 SUPPORTS_VIA_DEVICE_ID = "via_device_id" in getattr(DeviceInfo, "__annotations__", {})
+
+
+@callback
+def async_discover_fan_controls(coordinator, entry, add_fan_entities):
+    """Add the platform's fan entities once when Bcaa firmware is discovered."""
+    if supports_fan_controls(coordinator.data):
+        add_fan_entities()
+        return
+
+    unsubscribe = None
+
+    @callback
+    def stop_listening():
+        nonlocal unsubscribe
+        if unsubscribe is not None:
+            unsubscribe()
+            unsubscribe = None
+
+    @callback
+    def check_firmware():
+        if coordinator.last_update_success and supports_fan_controls(coordinator.data):
+            stop_listening()
+            add_fan_entities()
+
+    unsubscribe = coordinator.async_add_listener(check_firmware)
+    entry.async_on_unload(stop_listening)
+
 
 class ModbusBridgeEntity(CoordinatorEntity):
     """A base class for all LuxPower Modbus entities."""
@@ -70,6 +98,18 @@ class ModbusBridgeEntity(CoordinatorEntity):
                 self._attr_unique_id = f"{entity_prefix}_{self._register}_{id_name}"
 
     @property
+    def available(self) -> bool:
+        if not self._desc.get("fan_mask"):
+            return super().available
+        data = self.coordinator.data or {}
+        word = data.get("hold", {}).get(self._register)
+        return (
+            super().available
+            and supports_fan_controls(data)
+            and word not in (None, UNIMPLEMENTED_REGISTER_VALUE)
+        )
+
+    @property
     def _write_lock(self):
         """Return the per-entry lock that serialises read-modify-write cycles."""
         return self.coordinator.hass.data[DOMAIN][self._entry.entry_id]["write_lock"]
@@ -91,31 +131,36 @@ class ModbusBridgeEntity(CoordinatorEntity):
             return False
 
         async with self._write_lock:
-            registers = self.coordinator.data.setdefault(self._register_type, {})
+            # The inverter's web UI can change a sibling fan field between polls.
+            # Compose from a live read on the write connection instead of the cache.
+            if mask := self._desc.get("fan_mask"):
+                if not self.available:
+                    raise HomeAssistantError(f"'{self.name}' is unavailable on the current inverter data.")
+                if not await self._api_client.async_write_register(self._register, compose_value(0), mask=mask):
+                    raise HomeAssistantError(
+                        f"Could not safely update '{self.name}': register {self._register} "
+                        "requires supported firmware, a readable register, and a confirmed write."
+                    )
+            else:
+                registers = self.coordinator.data.setdefault(self._register_type, {})
+                # Composing against an unread register would zero sibling controls.
+                # On register 21 that sets Working Mode to Standby. Refuse to guess.
+                if needs_current and self._register not in registers:
+                    raise HomeAssistantError(
+                        f"Cannot write '{self.name}': register {self._register} has not "
+                        "been read from the inverter yet. Wait for a successful poll and "
+                        "try again."
+                    )
 
-            # Composing against a register that has never been read would write
-            # zeros into every sibling control packed beside this one. On register
-            # 21 that silently sets Working Mode to Standby and stops the inverter,
-            # which is what happens when an automation fires after a restart whose
-            # first settings poll failed. Refuse rather than guess.
-            if needs_current and self._register not in registers:
-                raise HomeAssistantError(
-                    f"Cannot write '{self.name}': register {self._register} has not "
-                    "been read from the inverter yet. Wait for a successful poll and "
-                    "try again."
-                )
+                value_to_write = compose_value(registers.get(self._register, 0))
+                if not await self._api_client.async_write_register(self._register, value_to_write):
+                    return False
 
-            current_value = registers.get(self._register, 0)
-            value_to_write = compose_value(current_value)
+                registers[self._register] = value_to_write
+                self.async_write_ha_state()
 
-            if not await self._api_client.async_write_register(self._register, value_to_write):
-                return False
-
-            registers[self._register] = value_to_write
-            self.async_write_ha_state()
-
-            # The client confirmed the write and re-read the affected settings block
-            # on the same connection, so publish that rather than asking for a fresh
+            # The client confirmed the write and re-read settings on the same
+            # connection, so publish that rather than asking for a fresh
             # poll. A poll re-reads every register block, which kept the service call
             # blocked for tens of seconds after the inverter had already applied the
             # change. Publishing inside the lock also means the next write on a shared
@@ -165,7 +210,10 @@ class ModbusBridgeEntity(CoordinatorEntity):
             source = data.get("battery", {}).get(self._battery_serial, {})
         else:
             source = data.get(self._register_type, {})
-        return source.get(self._register)
+        value = source.get(self._register)
+        if self._desc.get("fan_mask"):
+            return (value, self.available)
+        return value
 
 
     @property

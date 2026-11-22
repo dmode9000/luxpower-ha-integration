@@ -110,6 +110,12 @@ def format_firmware_version(hold_registers: dict) -> str | None:
     except Exception:
         return None
 
+def supports_fan_controls(data: dict | None) -> bool:
+    """Match the Bcaa and cBaa SNA6000 firmware prefixes explicitly."""
+    firmware = format_firmware_version((data or {}).get("hold", {}))
+    return bool(firmware and firmware.startswith(("BCAA-", "CBAA-")))
+
+
 def get_highest_set_bit(value: int) -> int | None:
     """Finds the position of the highest set bit in an integer."""
     if not isinstance(value, int) or value == 0:

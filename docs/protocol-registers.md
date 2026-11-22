@@ -80,6 +80,37 @@ A consequence worth knowing: a register reading 0 with a documented floor of 42.
 displays 0 but cannot be written back as 0, because the floor is real. That is
 correct behaviour, not a bug.
 
+## SNA6000 Bcaa fan settings (hold register 178)
+
+The integration adds these four controls when a settings poll identifies the
+`Bcaa` firmware family, even if the first poll did not read the firmware. Once
+added, the controls are unavailable if the reported firmware no longer matches
+or the fan word is missing or unimplemented. The field layout was verified
+against FC03 snapshots:
+
+| Setting | Mask | Shift |
+|---|---:|---:|
+| Fan 1 Max Speed (%) | `0x00FE` | 1 |
+| Fan 2 Max Speed (%) | `0xFE00` | 9 |
+| Fan 1 Speed Slope | `0x0001` | 0 |
+| Fan 2 Speed Slope | `0x0100` | 8 |
+
+`0xC8C8` is 100% / 100% with both slopes Default. A set slope bit means High
+Speed. Changing just Fan 1 or Fan 2 to High Speed gave `0xC8C9` or `0xC9C8`;
+changing just Fan 1 or Fan 2 to 99% gave `0xC8C6` or `0xC6C8`.
+
+Max-speed writes accept whole percentages from 20–100%: the intersection of the
+[SNA6000 web UI range (10–100%)](https://dmode9000.github.io/luxpower-sna6000-wiki/settings/fan_max_speed.html)
+and the older SNA 3–6K manual's 20–100%. Values read from the inverter are not
+clamped to this range. An unreadable word or `0xFFFF` must not be used for a write.
+Each Home Assistant fan write first verifies the firmware with an exact FC03
+read of registers 7–10. On the same connection, it reads the fan word with FC03,
+sends the masked FC06 write, and reads that word back with FC03. Polling and other
+integration writes cannot interleave with this transaction. The readback must
+match the requested field; the FC06 echo alone is not published. On failure,
+the prior state remains until polling refreshes it, and the write is not retried.
+This sequence does not lock out a separate inverter client.
+
 ## Unresolved
 
 Not covered by the document. Each has a description that contradicts its own

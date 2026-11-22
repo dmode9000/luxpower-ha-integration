@@ -3,8 +3,8 @@ import logging
 from homeassistant.components.select import SelectEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, CONF_ENTITY_PREFIX, DEFAULT_ENTITY_PREFIX
-from .entity import ModbusBridgeEntity
+from .const import DOMAIN, CONF_ENTITY_PREFIX, DEFAULT_ENTITY_PREFIX, UNIMPLEMENTED_REGISTER_VALUE
+from .entity import ModbusBridgeEntity, async_discover_fan_controls
 from .entity_descriptions.selectbox_types import SELECTBOX_TYPES
 
 _LOGGER = logging.getLogger(__name__)
@@ -14,12 +14,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     entity_prefix = hass.data[DOMAIN][entry.entry_id]['settings'].get(CONF_ENTITY_PREFIX, DEFAULT_ENTITY_PREFIX)
     api_client = hass.data[DOMAIN][entry.entry_id]["api_client"]
-    
     entities = [
         ModbusBridgeSelect(coordinator, entry, desc, entity_prefix, api_client)
         for desc in SELECTBOX_TYPES
+        if not desc.get("fan_mask")
     ]
     async_add_entities(entities)
+    async_discover_fan_controls(coordinator, entry, lambda: async_add_entities([
+        ModbusBridgeSelect(coordinator, entry, desc, entity_prefix, api_client)
+        for desc in SELECTBOX_TYPES if desc.get("fan_mask")
+    ]))
 
 class ModbusBridgeSelect(ModbusBridgeEntity, SelectEntity):
     """Represents a select entity that maps a register value to a list of options."""
@@ -39,6 +43,8 @@ class ModbusBridgeSelect(ModbusBridgeEntity, SelectEntity):
         """Return the currently selected option."""
         register_value = self.coordinator.data.get(self._register_type, {}).get(self._register)
         if register_value is None:
+            return None
+        if self._desc.get("fan_mask") and register_value == UNIMPLEMENTED_REGISTER_VALUE:
             return None
         
         # Use the extract function to get the numerical index from the register

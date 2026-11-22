@@ -1,6 +1,7 @@
 import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -14,7 +15,7 @@ from .const import (
     REFERENCE_BATTERY_VOLTAGE_CLASS,
     UNIMPLEMENTED_REGISTER_VALUE,
 )
-from .entity import ModbusBridgeEntity
+from .entity import ModbusBridgeEntity, async_discover_fan_controls
 from .entity_descriptions.number_types import NUMBER_TYPES
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,13 +25,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     entity_prefix = hass.data[DOMAIN][entry.entry_id]['settings'].get(CONF_ENTITY_PREFIX, DEFAULT_ENTITY_PREFIX)
     api_client = hass.data[DOMAIN][entry.entry_id]["api_client"]
-    
     entities = [
         ModbusBridgeNumber(coordinator, entry, desc, entity_prefix, api_client)
         for desc in NUMBER_TYPES
-        if not desc.get("percent_of_rated_power") or rated_power(entry)
+        if not desc.get("fan_mask") and (not desc.get("percent_of_rated_power") or rated_power(entry))
     ]
     async_add_entities(entities)
+    async_discover_fan_controls(coordinator, entry, lambda: async_add_entities([
+        ModbusBridgeNumber(coordinator, entry, desc, entity_prefix, api_client)
+        for desc in NUMBER_TYPES if desc.get("fan_mask")
+    ]))
 
 
 def rated_power(entry) -> int | None:
@@ -156,6 +160,15 @@ class ModbusBridgeNumber(ModbusBridgeEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
+        if self._desc.get("fan_mask") and (
+            not self.native_min_value <= value <= self.native_max_value
+            or not float(value).is_integer()
+        ):
+            raise HomeAssistantError(
+                f"'{self.name}' requires a whole percentage from "
+                f"{self.native_min_value:g} to {self.native_max_value:g}."
+            )
+
         # Scale the UI value up to the raw integer value for writing to the register.
         # round() is required: int(58.1 * 10) is 580, not 581, because 58.1 has no
         # exact binary representation — truncating writes the wrong value.
